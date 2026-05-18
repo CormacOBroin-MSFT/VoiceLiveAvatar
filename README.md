@@ -41,14 +41,17 @@ The avatar feature is currently available in the following service regions: Sout
    pip install -r requirements.txt
    ```
 
-2. **Configure environment (optional):**
+2. **Configure environment and defaults (recommended):**
 
-   You can optionally set environment variables to pre-fill settings:
+   Run the interactive setup script. It prompts for your Azure credentials and common conversation defaults, writes `.env`, and seeds `defaults/instructions.txt` / `defaults/priming.json` from their `.example` templates (only if those files don't already exist, so your local edits are never overwritten):
 
-   - `AZURE_VOICELIVE_ENDPOINT` - Your Azure AI Services endpoint
-   - `AZURE_VOICELIVE_API_KEY` - Your API key
-   - `VOICELIVE_MODEL` - Model to use (default: `gpt-4o-realtime`)
-   - `VOICELIVE_VOICE` - Voice name (default: `en-US-AvaMultilingualNeural`)
+   ```bash
+   ./setup.sh
+   ```
+
+   You can re-run `./setup.sh` at any time — existing values are shown in brackets and kept by pressing Enter.
+
+   If you prefer to configure manually, copy `.env.example` to `.env` and edit it directly. See the next section for what each value does and what to put inside the long-form default files.
 
 3. **Run the server:**
 
@@ -65,6 +68,76 @@ The avatar feature is currently available in the following service regions: Sout
 4. **Open the browser:**
 
    Navigate to [http://localhost:3000](http://localhost:3000)
+
+### Configuration files
+
+The frontend form is pre-populated on page load from three local files. The backend exposes their values via `GET /api/config` (see `app.py`).
+
+#### `.env`
+
+Short scalar settings and credentials. Tracked template: `.env.example`. Your real `.env` is gitignored.
+
+| Variable | Purpose | Example |
+|---|---|---|
+| `AZURE_VOICELIVE_ENDPOINT` | Your Azure AI Services endpoint URL. | `https://<name>.cognitiveservices.azure.com/` |
+| `AZURE_VOICELIVE_API_KEY` | API key for the resource above. Never commit this. | `abc123…` |
+| `VOICELIVE_MODEL` | Default model selected in the UI. | `gpt-realtime` |
+| `VOICELIVE_VOICE` | Default voice name. | `en-US-AvaMultilingualNeural` |
+| `VOICELIVE_VOICE_SPEED` | Default voice speed (50–150). | `100` |
+| `VOICELIVE_AVATAR_ENABLED` | Avatar toggle default. | `true` / `false` |
+| `VOICELIVE_ENABLE_PROACTIVE` | "Enable proactive responses" default. | `true` / `false` |
+| `VOICELIVE_ENABLE_PRIMING` | "Enable priming context" default. | `true` / `false` |
+| `VOICELIVE_INSTRUCTIONS` *(optional)* | Inline override for the instructions file. If set, takes precedence over `defaults/instructions.txt`. | *(usually unset)* |
+| `VOICELIVE_PRIMING_MESSAGE` *(optional)* | Inline override for the priming file. If set, takes precedence over `defaults/priming.json`. | *(usually unset)* |
+
+#### `defaults/instructions.txt`  *(your default system prompt)*
+
+The full contents of this file are loaded into the **Model instructions** textarea on page load. This is the system prompt that shapes the assistant's role, tone, task, and constraints. Tracked template: `defaults/instructions.txt.example`. The live file is gitignored.
+
+- **Put inside:** plain-text instructions describing the assistant's role and behaviour — for example, an interviewer persona, a customer-support script, a coaching agent, etc. Markdown formatting is fine (it's just text to the model).
+- **When it's used:** sent as `instructions` on `session.update` at the start of every session in `Model` mode.
+- **To customise:** open `defaults/instructions.txt` in your editor and replace the placeholder with your own prompt. No restart is needed for new sessions — the file is read fresh on each `/api/config` request, which happens on every page load.
+
+Minimal example:
+
+```
+You are a friendly virtual receptionist for Contoso Dental. Greet the caller,
+identify yourself, and ask how you can help. Keep replies under 30 words. If
+they want to book an appointment, collect their name, preferred date, and
+phone number, in that order, one question at a time.
+```
+
+#### `defaults/priming.json`  *(your default priming message)*
+
+The full contents of this file are loaded into the **Priming Message** textarea on page load. When **Enable priming context** is on, the contents are injected into the conversation as the **first user-role message** before the assistant's first response, so the model replies as if the user had said this. Tracked template: `defaults/priming.json.example`. The live file is gitignored.
+
+- **Put inside:** anything you want the model to treat as the user's opening turn. Despite the `.json` extension, the file is sent verbatim as a string — structured JSON is just a convenient way to hand the model rich context (a customer record, a student profile, a ticket payload, etc.), but plain text works equally well.
+- **When it's used:** only when the **Enable priming context** toggle is on. If both proactive and priming are on, the assistant produces a single response that replies to the priming message.
+- **To customise:** open `defaults/priming.json` in your editor and replace the placeholder with your payload.
+
+Minimal example (structured):
+
+```json
+{
+  "customer": {
+    "name": "Jane Doe",
+    "accountId": "A-10472",
+    "openTickets": [
+      { "id": "T-882", "subject": "Cannot log in", "openedDays": 3 }
+    ]
+  }
+}
+```
+
+Minimal example (plain text — also valid even though the file ends in `.json`):
+
+```
+Pretend the user just said: "Hi, I'm calling because my internet has been
+down since yesterday morning and I've already tried restarting the router."
+```
+
+> **Tip:** because `defaults/instructions.txt` and `defaults/priming.json` are gitignored, you can keep per-deployment or per-customer prompts locally without polluting the repo. Update the `.example` templates when you want to ship a new default to other clones.
+
 
 ### Build and run with Docker
 
@@ -123,15 +196,22 @@ This sample can be deployed to cloud for global access. The recommended hosting 
 
 ```
 voice-live-avatar/
-├── app.py              # FastAPI server, WebSocket endpoint, static file serving
-├── voice_handler.py    # Voice Live SDK session management, event processing
-├── requirements.txt    # Python dependencies
-├── Dockerfile          # Docker container configuration
-├── README.md           # This file
+├── app.py                          # FastAPI server, WebSocket endpoint, /api/config, static file serving
+├── voice_handler.py                # Voice Live SDK session management, event processing, priming injection
+├── setup.sh                        # Interactive setup: writes .env and seeds defaults/ from templates
+├── requirements.txt                # Python dependencies
+├── Dockerfile                      # Docker container configuration
+├── README.md                       # This file
+├── .env.example                    # Template for .env (credentials + simple defaults)
+├── defaults/
+│   ├── instructions.txt.example    # Template for the default system prompt (Model instructions)
+│   ├── priming.json.example        # Template for the default priming message
+│   ├── instructions.txt            # Your local system prompt (gitignored, seeded by setup.sh)
+│   └── priming.json                # Your local priming payload (gitignored, seeded by setup.sh)
 └── static/
-    ├── index.html      # Main UI page
-    ├── style.css       # Styles
-    └── app.js          # Client-side JS (audio, WebRTC, WebSocket, UI)
+    ├── index.html                  # Main UI page
+    ├── style.css                   # Styles
+    └── app.js                      # Client-side JS (audio, WebRTC, WebSocket, UI, /api/config consumer)
 ```
 
 ## WebSocket Protocol
