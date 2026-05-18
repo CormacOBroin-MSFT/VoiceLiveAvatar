@@ -1,0 +1,4 @@
+{
+  "_comment": "Template for defaults/priming.json. Replace the entire contents of this file with the JSON (or plain text) you want injected as the first user message when 'Enable priming context' is on. This is loaded into the 'Priming Message' field on page load via /api/config in app.py. Remove this _comment key before use.",
+  "_todo": "Put your default priming payload here (e.g. a student/customer profile object)."
+}

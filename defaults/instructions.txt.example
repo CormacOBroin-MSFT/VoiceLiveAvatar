@@ -1,0 +1,15 @@
+# Template for defaults/instructions.txt
+#
+# Replace this entire file with the system prompt / model instructions you want
+# the assistant to use by default. This text is loaded into the "Model
+# instructions" field on the frontend when the page loads (see /api/config in
+# app.py).
+#
+# Notes:
+# - Plain text only; the whole file content is sent as the system prompt.
+# - Lines starting with "#" are NOT stripped — remove this comment block before
+#   use, or `setup.sh` will copy it verbatim into defaults/instructions.txt.
+# - Keep it focused: describe the role, tone, task, constraints, and any
+#   structured outline the assistant should follow.
+#
+# TODO: Put your default system prompt here.
