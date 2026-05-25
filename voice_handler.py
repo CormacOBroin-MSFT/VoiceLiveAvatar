@@ -12,6 +12,7 @@ import os
 from typing import Any, Callable, Optional
 
 from azure.ai.voicelive.aio import connect
+from latency import LatencyTracker
 from azure.ai.voicelive.models import (
     AvatarConfig,
     AzureCustomVoice,
@@ -53,6 +54,7 @@ class VoiceSessionHandler:
         credential: Any,
         send_message: Callable,
         config: dict,
+        latency_tracker: Optional["LatencyTracker"] = None,
     ):
         self.client_id = client_id
         self.endpoint = endpoint
@@ -64,6 +66,7 @@ class VoiceSessionHandler:
         self.is_running = False
         self._event_task: Optional[asyncio.Task] = None
         self._pending_proactive = False
+        self.latency = latency_tracker
 
     async def start(self):
         """Start the Voice Live session."""
@@ -71,6 +74,17 @@ class VoiceSessionHandler:
             self.is_running = True
             model = self.config.get("model", os.getenv("VOICELIVE_MODEL", "gpt-realtime"))
             mode = self.config.get("mode", "model")
+
+            if self.latency:
+                self.latency.mark_session_start()
+                self.latency.set_session_metadata(
+                    model=model,
+                    mode=mode,
+                    voice=self.config.get("voiceName", ""),
+                    avatar_enabled=bool(self.config.get("avatarEnabled", False)),
+                    avatar_output_mode=self.config.get("avatarOutputMode", ""),
+                    turn_detection=self.config.get("turnDetectionType", ""),
+                )
 
             # Build connection model string based on mode
             if mode == "agent":
@@ -178,6 +192,9 @@ class VoiceSessionHandler:
         )
         if session_updated is None:
             raise ValueError("SESSION_UPDATED event not received")
+
+        if self.latency:
+            self.latency.mark_session_ready()
 
         logger.info(f"Session configured for client {self.client_id}")
 
@@ -458,6 +475,8 @@ class VoiceSessionHandler:
             # Audio delta - relay to browser
             if event_type == ServerEventType.RESPONSE_AUDIO_DELTA:
                 if hasattr(event, "delta") and event.delta:
+                    if self.latency:
+                        self.latency.mark_first_audio_delta()
                     audio_b64 = base64.b64encode(event.delta).decode("utf-8")
                     self._audio_delta_count = getattr(self, '_audio_delta_count', 0) + 1
                     if self._audio_delta_count <= 3 or self._audio_delta_count % 100 == 0:
@@ -470,11 +489,19 @@ class VoiceSessionHandler:
                     })
 
             elif event_type == ServerEventType.RESPONSE_AUDIO_DONE:
+                if self.latency:
+                    self.latency.mark_audio_done()
                 await self.send_message({"type": "audio_done"})
 
             # Audio transcript (assistant speaking text)
             elif event_type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DELTA:
                 if hasattr(event, "delta") and event.delta:
+                    # In webrtc/websocket-avatar modes, audio is delivered out-of-band
+                    # so RESPONSE_AUDIO_DELTA never fires on the server. The transcript
+                    # delta arrives in lock-step with audio synthesis, so use it as the
+                    # 'first response chunk' fallback for the headline metric.
+                    if self.latency:
+                        self.latency.mark_first_audio_delta()
                     await self.send_message({
                         "type": "transcript_delta",
                         "role": "assistant",
@@ -483,6 +510,11 @@ class VoiceSessionHandler:
 
             elif event_type == ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DONE:
                 transcript = getattr(event, "transcript", "")
+                if self.latency:
+                    # Fallback: when audio_done doesn't fire (webrtc avatar), use
+                    # transcript_done as the response-end marker.
+                    self.latency.mark_audio_done()
+                    self.latency.set_assistant_transcript(transcript)
                 await self.send_message({
                     "type": "transcript_done",
                     "role": "assistant",
@@ -492,6 +524,8 @@ class VoiceSessionHandler:
             # Text delta (for text responses)
             elif event_type == ServerEventType.RESPONSE_TEXT_DELTA:
                 if hasattr(event, "delta") and event.delta:
+                    if self.latency:
+                        self.latency.mark_first_audio_delta()
                     await self.send_message({
                         "type": "text_delta",
                         "delta": event.delta,
@@ -499,6 +533,8 @@ class VoiceSessionHandler:
 
             elif event_type == ServerEventType.RESPONSE_TEXT_DONE:
                 text = getattr(event, "text", "")
+                if self.latency:
+                    self.latency.mark_audio_done()
                 await self.send_message({
                     "type": "text_done",
                     "text": text,
@@ -508,23 +544,31 @@ class VoiceSessionHandler:
             elif event_type == ServerEventType.RESPONSE_CREATED:
                 response_id = getattr(event, "response", None)
                 rid = response_id.id if response_id and hasattr(response_id, "id") else ""
+                if self.latency:
+                    self.latency.mark_response_created(rid)
                 await self.send_message({
                     "type": "response_created",
                     "responseId": rid,
                 })
 
             elif event_type == ServerEventType.RESPONSE_DONE:
+                if self.latency:
+                    self.latency.mark_response_done()
                 await self.send_message({"type": "response_done"})
 
             # Speech detection
             elif event_type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STARTED:
                 item_id = getattr(event, "item_id", "") or getattr(event, "itemId", "")
+                if self.latency:
+                    self.latency.mark_speech_started(item_id)
                 await self.send_message({
                     "type": "speech_started",
                     "itemId": item_id,
                 })
 
             elif event_type == ServerEventType.INPUT_AUDIO_BUFFER_SPEECH_STOPPED:
+                if self.latency:
+                    self.latency.mark_speech_stopped()
                 await self.send_message({
                     "type": "speech_stopped",
                 })
@@ -533,6 +577,8 @@ class VoiceSessionHandler:
             elif event_type == ServerEventType.CONVERSATION_ITEM_INPUT_AUDIO_TRANSCRIPTION_COMPLETED:
                 transcript = getattr(event, "transcript", "")
                 item_id = getattr(event, "item_id", "") or getattr(event, "itemId", "")
+                if self.latency:
+                    self.latency.mark_user_transcript_done(item_id, transcript)
                 if transcript:
                     await self.send_message({
                         "type": "transcript_done",
@@ -545,6 +591,8 @@ class VoiceSessionHandler:
             elif event_type == ServerEventType.SESSION_AVATAR_CONNECTING:
                 server_sdp = getattr(event, "server_sdp", "")
                 if server_sdp:
+                    if self.latency:
+                        self.latency.mark_avatar_connected()
                     await self.send_message({
                         "type": "avatar_sdp_answer",
                         "serverSdp": server_sdp,
@@ -746,6 +794,8 @@ class VoiceSessionHandler:
         """Forward the browser's SDP offer to Voice Live for avatar WebRTC."""
         if self.connection:
             try:
+                if self.latency:
+                    self.latency.mark_avatar_sdp_offer()
                 # Log diagnostic info about the SDP format
                 sdp_preview = client_sdp[:60] if client_sdp else '(empty)'
                 logger.info(f"[SDP-CHECK] client_sdp starts with: {sdp_preview}")

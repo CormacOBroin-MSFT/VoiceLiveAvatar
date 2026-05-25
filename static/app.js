@@ -38,6 +38,142 @@ let sourceBuffer = null;
 let videoChunksQueue = [];
 let pendingWsVideoElement = null;
 
+// ===== Latency Monitor =====
+// Captures browser-side perceptual timing for each turn so we can derive
+// mouth-to-ear latency (server EOU → user actually hears audio).
+const Latency = {
+    enabled: false,
+    currentResponseId: null,
+    currentTurnStartMs: 0,        // performance.now() at response_created
+    firstAudioOffsetMs: null,     // ms from response_created to first audio chunk played in browser (non-webrtc paths only)
+    firstResponseOffsetMs: null,  // ms from response_created to first assistant transcript_delta in browser (all modes)
+    history: [],                  // last N turns of server-reported metrics
+    maxHistory: 20,
+};
+
+function latencyOnResponseCreated(responseId) {
+    if (!Latency.enabled) return;
+    // Send the previous turn's client offsets if not already sent.
+    latencyFlushClientOffsets();
+    Latency.currentResponseId = responseId || null;
+    Latency.currentTurnStartMs = performance.now();
+    Latency.firstAudioOffsetMs = null;
+    Latency.firstResponseOffsetMs = null;
+}
+
+function latencyOnFirstAudio() {
+    if (!Latency.enabled || Latency.currentTurnStartMs === 0) return;
+    if (Latency.firstAudioOffsetMs !== null) return;
+    Latency.firstAudioOffsetMs = Math.round(performance.now() - Latency.currentTurnStartMs);
+    latencyMaybeSend();
+}
+
+function latencyOnFirstResponseChunk() {
+    if (!Latency.enabled || Latency.currentTurnStartMs === 0) return;
+    if (Latency.firstResponseOffsetMs !== null) return;
+    Latency.firstResponseOffsetMs = Math.round(performance.now() - Latency.currentTurnStartMs);
+    latencyMaybeSend();
+}
+
+function latencyMaybeSend() {
+    if (!Latency.enabled || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (Latency.firstAudioOffsetMs === null && Latency.firstResponseOffsetMs === null) return;
+    ws.send(JSON.stringify({
+        type: 'latency_client',
+        payload: {
+            response_id: Latency.currentResponseId,
+            first_audio_offset_ms: Latency.firstAudioOffsetMs,
+            first_response_offset_ms: Latency.firstResponseOffsetMs,
+        },
+    }));
+}
+
+function latencyFlushClientOffsets() {
+    if (Latency.firstAudioOffsetMs === null && Latency.firstResponseOffsetMs === null) return;
+    latencyMaybeSend();
+}
+
+function latencyOnServerMetrics(msg) {
+    if (!Latency.enabled) return;
+    const m = msg.metrics || {};
+    Latency.history.push({
+        turn: msg.turn,
+        responseId: msg.responseId,
+        userTranscript: msg.userTranscript || '',
+        metrics: m,
+        ts: Date.now(),
+    });
+    if (Latency.history.length > Latency.maxHistory) {
+        Latency.history.shift();
+    }
+    renderLatencyPanel();
+}
+
+function renderLatencyPanel() {
+    const panel = document.getElementById('latencyPanel');
+    const body = document.getElementById('latencyPanelBody');
+    if (!panel || !body) return;
+    panel.style.display = (isDeveloperMode && Latency.history.length > 0) ? '' : 'none';
+    if (!isDeveloperMode || Latency.history.length === 0) return;
+
+    // Rolling stats for the headline metric
+    const headline = Latency.history
+        .map(h => h.metrics.eou_to_first_audio_ms)
+        .filter(v => typeof v === 'number');
+    const ear = Latency.history
+        .map(h => h.metrics.eou_to_client_first_response_ms)
+        .filter(v => typeof v === 'number');
+    const stats = (arr) => {
+        if (!arr.length) return '–';
+        const min = Math.min(...arr), max = Math.max(...arr);
+        const avg = Math.round(arr.reduce((a, b) => a + b, 0) / arr.length);
+        return `min ${Math.round(min)} · avg ${avg} · max ${Math.round(max)} ms`;
+    };
+
+    const rows = Latency.history.slice().reverse().map(h => {
+        const m = h.metrics;
+        const fmt = (v) => (typeof v === 'number') ? `${Math.round(v)}` : '–';
+        const headlineCls =
+            (typeof m.eou_to_first_audio_ms !== 'number') ? 'lat-na'
+            : (m.eou_to_first_audio_ms < 800) ? 'lat-good'
+            : (m.eou_to_first_audio_ms < 1500) ? 'lat-ok' : 'lat-bad';
+        const utter = (h.userTranscript || '').replace(/</g, '&lt;').slice(0, 60);
+        return `<tr>
+            <td>${h.turn}</td>
+            <td class="${headlineCls}"><b>${fmt(m.eou_to_first_audio_ms)}</b></td>
+            <td>${fmt(m.eou_to_response_created_ms)}</td>
+            <td>${fmt(m.response_created_to_first_audio_ms)}</td>
+            <td>${fmt(m.first_audio_to_audio_done_ms)}</td>
+            <td>${fmt(m.stt_latency_ms)}</td>
+            <td>${fmt(m.eou_to_client_first_response_ms)}</td>
+            <td class="lat-utter" title="${utter}">${utter}</td>
+        </tr>`;
+    }).join('');
+
+    body.innerHTML = `
+        <div class="lat-stats">
+            <span><b>EOU→first_audio</b> (server): ${stats(headline)}</span>
+            <span><b>EOU→response</b> (end-to-end): ${stats(ear)}</span>
+        </div>
+        <table class="lat-table">
+            <thead><tr>
+                <th title="Turn #">#</th>
+                <th title="End of user speech → first response chunk on the server (in webrtc avatar mode this is the transcript_delta, which arrives in lock-step with synthesised audio)">EOU→audio</th>
+                <th title="EOU → model response.created">EOU→create</th>
+                <th title="response.created → first response chunk (TTFB)">create→TTFB</th>
+                <th title="First chunk → response audio/transcript done (response duration)">audio_dur</th>
+                <th title="EOU → user transcript completed">STT</th>
+                <th title="EOU → first response chunk arrived in the browser (perceived reaction time)">→resp</th>
+                <th>Utterance</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+        <div class="lat-hint">All values in ms. Updates on every assistant response. Server log: <code>logs/latency.jsonl</code></div>
+    `;
+}
+
+// ===== END Latency Monitor =====
+
 const clientId = 'client-' + Math.random().toString(36).substr(2, 9);
 
 // ===== DOM Ready =====
@@ -77,6 +213,11 @@ async function fetchServerConfig() {
         if (config.primingMessage) {
             document.getElementById('primingMessage').value = config.primingMessage;
         }
+        if (typeof config.latencyLogging === 'boolean') {
+            Latency.enabled = config.latencyLogging;
+        } else {
+            Latency.enabled = true;
+        }
 
         updateConditionalFields();
     } catch (e) {
@@ -104,6 +245,7 @@ function setupUIBindings() {
     document.getElementById('developerMode').addEventListener('change', (e) => {
         isDeveloperMode = e.target.checked;
         updateDeveloperModeLayout();
+        renderLatencyPanel();
     });
     // Turn detection type
     document.getElementById('turnDetectionType').addEventListener('change', updateConditionalFields);
@@ -550,10 +692,12 @@ function handleServerMessage(msg) {
             break;
         case 'transcript_delta':
             if (msg.role === 'assistant') {
+                latencyOnFirstResponseChunk();
                 onAssistantDelta(msg.delta);
             }
             break;
         case 'text_delta':
+            latencyOnFirstResponseChunk();
             onAssistantDelta(msg.delta);
             break;
         case 'text_done':
@@ -569,9 +713,11 @@ function handleServerMessage(msg) {
             pendingAssistantText = '';
             addMessage('assistant', '');
             isSpeaking = true;
+            latencyOnResponseCreated(msg.responseId);
             break;
         case 'response_done':
             isSpeaking = false;
+            latencyFlushClientOffsets();
             // Don't stop play-chunk animation here - the animation loop
             // will self-terminate when all buffered audio finishes playing
             break;
@@ -584,6 +730,9 @@ function handleServerMessage(msg) {
             break;
         case 'video_data':
             handleVideoChunk(msg.delta);
+            break;
+        case 'latency_metrics':
+            latencyOnServerMetrics(msg);
             break;
         default:
             // Log unknown events in dev mode
@@ -973,6 +1122,7 @@ function stopAudioCapture() {
 let audioDeltaCount = 0;
 function handleAudioDelta(base64Data) {
     if (!base64Data) return;
+    latencyOnFirstAudio();
     // Lazily create the playback AudioContext on the first chunk. This runs
     // on a WebSocket callback (not a user gesture) but the page already has
     // user activation from the Connect click + getUserMedia grant, so Chrome

@@ -89,6 +89,8 @@ Short scalar settings and credentials. Tracked template: `.env.example`. Your re
 | `VOICELIVE_ENABLE_PRIMING` | "Enable priming context" default. | `true` / `false` |
 | `VOICELIVE_INSTRUCTIONS` *(optional)* | Inline override for the instructions file. If set, takes precedence over `defaults/instructions.txt`. | *(usually unset)* |
 | `VOICELIVE_PRIMING_MESSAGE` *(optional)* | Inline override for the priming file. If set, takes precedence over `defaults/priming.json`. | *(usually unset)* |
+| `LATENCY_LOG_ENABLED` | Per-turn latency logging (console + JSONL + dev-mode panel). | `true` *(default)* / `false` |
+| `LATENCY_LOG_FILE` | Path for the append-only JSONL latency log (one record per assistant turn). | `logs/latency.jsonl` *(default)* |
 
 #### `defaults/instructions.txt`  *(your default system prompt)*
 
@@ -192,12 +194,46 @@ This sample can be deployed to cloud for global access. The recommended hosting 
 
 * Step 3: Once the `Azure Container App` is created, you can access the sample by navigating to the URL of the `Azure Container App` in your browser.
 
+## Latency logging
+
+Every assistant turn is timed end-to-end. The headline metric is **EOU → first audio**: the time from when the server's voice-activity detector says the user stopped talking, to the moment the first byte of synthesised audio arrives from Azure. This is what listeners experience as the assistant's "reaction time".
+
+Three sinks receive the data:
+
+1. **Console** — one colour-coded line per turn:
+   ```
+   [LATENCY] turn=3 EOU→first_audio=842ms create=312ms TTFB=530ms audio_dur=4120ms stt=240ms →resp=1010ms
+   ```
+   `EOU→first_audio < 800 ms` prints green, `< 1500 ms` yellow, otherwise red.
+2. **JSONL file** — one record per turn, append-only, at `logs/latency.jsonl` (configurable via `LATENCY_LOG_FILE`). Each line includes the user transcript, assistant transcript, response id, session metadata (model, voice, mode, avatar mode, turn-detection type), and every derived metric in ms.
+3. **Developer mode panel** — toggle **Developer mode** in the header to reveal a live table below the chat. Last 20 turns plus rolling min/avg/max for the headline and end-to-end metrics.
+
+Metrics captured:
+
+| Metric | Meaning |
+|---|---|
+| `user_speech_duration_ms` | Server VAD `speech_started` → `speech_stopped` |
+| `stt_latency_ms` | EOU → user transcript finalised |
+| `eou_to_response_created_ms` | EOU → model started a response (≈ thinking time) |
+| `response_created_to_first_audio_ms` | TTFB from response creation to first response chunk |
+| `eou_to_first_audio_ms` | **Headline.** EOU → first response chunk from Azure (audio delta when available, transcript delta otherwise — they arrive in lock-step with TTS synthesis) |
+| `first_audio_to_audio_done_ms` | Total response audio stream duration |
+| `eou_to_client_first_audio_ms` | EOU → first audio actually played in the browser (only when audio passes through the relay: no avatar, or WebSocket avatar) |
+| `eou_to_client_first_response_ms` | EOU → first assistant `transcript_delta` arrived in the browser (works in **all** modes including WebRTC avatar) |
+
+> **WebRTC avatar mode caveat:** Azure delivers synthesised audio directly to the browser over the peer connection, so the server never sees `RESPONSE_AUDIO_DELTA`. The tracker uses `RESPONSE_AUDIO_TRANSCRIPT_DELTA` as the "first response chunk" signal — it arrives at the same time as the audio stream starts and is therefore a faithful proxy for the headline metric.
+
+Browser-side timings are reported via a `latency_client` WebSocket message after each turn. Use `eou_to_client_first_response_ms` for the true end-to-end perceived reaction time regardless of avatar mode.
+
+Disable the whole subsystem with `LATENCY_LOG_ENABLED=false`.
+
 ## Project Structure
 
 ```
 voice-live-avatar/
 ├── app.py                          # FastAPI server, WebSocket endpoint, /api/config, static file serving
 ├── voice_handler.py                # Voice Live SDK session management, event processing, priming injection
+├── latency.py                      # Per-turn latency tracker (console + JSONL + browser panel)
 ├── setup.sh                        # Interactive setup: writes .env and seeds defaults/ from templates
 ├── requirements.txt                # Python dependencies
 ├── Dockerfile                      # Docker container configuration
@@ -208,6 +244,8 @@ voice-live-avatar/
 │   ├── priming.json.example        # Template for the default priming message
 │   ├── instructions.txt            # Your local system prompt (gitignored, seeded by setup.sh)
 │   └── priming.json                # Your local priming payload (gitignored, seeded by setup.sh)
+├── logs/
+│   └── latency.jsonl               # Append-only per-turn latency log (created on first turn)
 └── static/
     ├── index.html                  # Main UI page
     ├── style.css                   # Styles

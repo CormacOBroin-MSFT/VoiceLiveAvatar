@@ -20,6 +20,7 @@ from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
 from voice_handler import VoiceSessionHandler
+from latency import LatencyTracker
 
 load_dotenv()
 
@@ -56,6 +57,28 @@ logging.basicConfig(
     handlers=[handler],
 )
 logger = logging.getLogger(__name__)
+
+# Latency logging configuration
+
+def _env_bool_global(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+LATENCY_LOG_ENABLED = _env_bool_global("LATENCY_LOG_ENABLED", True)
+LATENCY_LOG_FILE = os.getenv(
+    "LATENCY_LOG_FILE",
+    os.path.join(os.path.dirname(__file__), "logs", "latency.jsonl"),
+)
+if LATENCY_LOG_ENABLED and LATENCY_LOG_FILE:
+    try:
+        os.makedirs(os.path.dirname(LATENCY_LOG_FILE) or ".", exist_ok=True)
+        logger.info(f"Latency logging enabled → {LATENCY_LOG_FILE}")
+    except Exception as exc:
+        logger.warning(f"Could not create latency log dir: {exc}")
+        LATENCY_LOG_FILE = ""
 
 # Track active sessions per client
 active_sessions: Dict[str, VoiceSessionHandler] = {}
@@ -144,6 +167,7 @@ async def get_config():
         "enablePriming": _env_bool("VOICELIVE_ENABLE_PRIMING", False),
         "instructions": instructions,
         "primingMessage": priming_message,
+        "latencyLogging": LATENCY_LOG_ENABLED,
     }
 
 
@@ -201,6 +225,11 @@ async def handle_message(client_id: str, message: dict, websocket: WebSocket):
         if handler:
             await handler.update_avatar_scene(message.get("avatar", {}))
 
+    elif msg_type == "latency_client":
+        handler = active_sessions.get(client_id)
+        if handler and handler.latency:
+            handler.latency.merge_client_metrics(message.get("payload", {}))
+
     else:
         logger.warning(f"Unknown message type: {msg_type}")
 
@@ -257,12 +286,20 @@ async def start_session(client_id: str, config: dict, websocket: WebSocket):
         except Exception as e:
             logger.error(f"Error sending to {client_id}: {e}")
 
+    latency_tracker = LatencyTracker(
+        client_id=client_id,
+        send_message=send_message,
+        jsonl_path=LATENCY_LOG_FILE if LATENCY_LOG_ENABLED else None,
+        enabled=LATENCY_LOG_ENABLED,
+    )
+
     handler = VoiceSessionHandler(
         client_id=client_id,
         endpoint=endpoint,
         credential=credential,
         send_message=send_message,
         config=config,
+        latency_tracker=latency_tracker,
     )
     active_sessions[client_id] = handler
 
@@ -270,6 +307,8 @@ async def start_session(client_id: str, config: dict, websocket: WebSocket):
     task = asyncio.create_task(handler.start())
     active_tasks[client_id] = task
     logger.info(f"Session started for {client_id}")
+
+# function to draw a circle using matplotlib, 
 
 
 async def stop_session(client_id: str):
